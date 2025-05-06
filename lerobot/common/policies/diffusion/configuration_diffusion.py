@@ -144,6 +144,8 @@ class DiffusionConfig(PreTrainedConfig):
     prediction_type: str = "epsilon"
     clip_sample: bool = True
     clip_sample_range: float = 1.0
+    encoder_type: str = "resnet"  # Options: 'resnet', 'vggt'
+    freeze_encoder: bool = False
 
     # Inference
     num_inference_steps: int | None = None

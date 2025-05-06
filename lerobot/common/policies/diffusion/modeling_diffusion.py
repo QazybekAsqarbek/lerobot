@@ -21,6 +21,7 @@ TODO(alexander-soare):
 """
 
 import math
+import sys
 from collections import deque
 from typing import Callable
 
@@ -43,6 +44,92 @@ from lerobot.common.policies.utils import (
     get_output_shape,
     populate_queues,
 )
+
+sys.path.append('libs/vggt')
+
+try:
+    from vggt.models.vggt import VGGT
+except ImportError:
+    VGGT = None
+
+
+class VGGT_DPT_FeatureEncoder(torch.nn.Module):  # TODO: requires proper normalization. update this
+    """
+    VGGT multi-view encoder that returns a (B, T, out_dim) tensor
+    suitable for `global_cond_feats` in Diffusion Policy.
+    """
+    def __init__(
+        self,
+        keep=("depth_feat", "pointmap_feat"),
+        img_hw: int = 98,
+        device: str = "cuda",
+        out_dim: int = 256,
+        unfreeze_blocks: int = 0     # 0 = keep VGGT frozen
+    ):
+        super().__init__()
+        self.keep     = keep
+        self.img_hw   = img_hw
+        self.device   = device
+
+        # ---------- 1. load & optionally unfreeze --------------------
+        self.vggt = VGGT.from_pretrained("facebook/VGGT-1B").eval().to(device)
+        self.vggt.depth_head.feature_only = True
+        self.vggt.point_head.feature_only = True
+
+        if unfreeze_blocks:                          # e.g. 4 for sim->real
+            for blk in self.vggt.encoder.layers[-unfreeze_blocks:]:
+                blk.requires_grad_(True)
+
+        # run one dummy pass to know feature dim
+        with torch.no_grad():
+            dummy = torch.zeros(1,1,1,3,img_hw,img_hw, device=device)
+            feat_dim = self._extract_features(dummy).shape[-1]
+
+        self.proj = torch.nn.Linear(feat_dim, out_dim)   # trainable
+        self.feature_dim = out_dim
+
+    # ------------ public forward (gradients for proj only) ----------
+    def forward(self, imgs: torch.Tensor) -> torch.Tensor:
+        """
+        imgs: (B, T, V, 3, H, W)
+        returns (B, T, out_dim)
+        """
+        feats = self._extract_features(imgs)          # no grad in backbone
+        feats = self.proj(feats)                      # learnable projection
+        return feats
+
+    # ------------ helper (VGGT inside no-grad) ----------------------
+    def _extract_features(self, imgs: torch.Tensor) -> torch.Tensor:
+        B, T, V, C, H, W = imgs.shape
+        imgs = F.interpolate(
+            imgs.view(B*T*V, C, H, W),
+            size=self.img_hw, mode="bilinear", align_corners=False
+        ).view(B*T, V, C, self.img_hw, self.img_hw)
+
+        with torch.no_grad():                         # freeze VGGT here
+            agg_tokens, patch_idx = self.vggt.aggregator(imgs)
+            outs = {}
+            if "depth_feat" in self.keep:
+                outs["depth_feat"] = self.vggt.depth_head(
+                    agg_tokens, imgs, patch_idx
+                )                                     # (B*T,V,C,h,w)
+            if "pointmap_feat" in self.keep:
+                outs["pointmap_feat"] = self.vggt.point_head(
+                    agg_tokens, imgs, patch_idx
+                )
+
+        flat = []
+        for k, feat in outs.items():
+            if feat.dim() == 5:                       # (B*T,V,C,h,w)
+                feat = feat.mean((-1, -2))            # global-avg pool
+            # normalise per-head
+            if k == "depth_feat":
+                feat = (feat - 5.0) / 5.0             # metres → -1..1
+            flat.append(feat)
+
+        fused = torch.cat(flat, dim=-1)               # (B*T,V,C')
+        fused = fused.mean(1)                         # average cameras
+        return fused.view(B, T, -1)                   # (B,T,D_raw)
 
 
 class DiffusionPolicy(PreTrainedPolicy):
@@ -83,10 +170,16 @@ class DiffusionPolicy(PreTrainedPolicy):
 
         self.diffusion = DiffusionModel(config)
 
+        # Freeze encoder if requested (after model is potentially moved to device)
+        if self.config.encoder_type == "vggt" and self.config.freeze_encoder:
+            for param in self.diffusion.rgb_encoder.parameters():
+                param.requires_grad = False
+
         self.reset()
 
     def get_optim_params(self) -> dict:
-        return self.diffusion.parameters()
+        # Only return parameters that require gradients
+        return filter(lambda p: p.requires_grad, self.diffusion.parameters())
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
@@ -179,7 +272,10 @@ class DiffusionModel(nn.Module):
         global_cond_dim = self.config.robot_state_feature.shape[0]
         if self.config.image_features:
             num_images = len(self.config.image_features)
-            if self.config.use_separate_rgb_encoder_per_camera:
+            if self.config.encoder_type == "vggt":
+                self.rgb_encoder = VGGT_DPT_FeatureEncoder(device="cuda")
+                global_cond_dim += self.rgb_encoder.feature_dim  # Corrected: VGGT handles multi-view internally
+            elif self.config.use_separate_rgb_encoder_per_camera:
                 encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
                 self.rgb_encoder = nn.ModuleList(encoders)
                 global_cond_dim += encoders[0].feature_dim * num_images
@@ -242,7 +338,10 @@ class DiffusionModel(nn.Module):
         global_cond_feats = [batch[OBS_ROBOT]]
         # Extract image features.
         if self.config.image_features:
-            if self.config.use_separate_rgb_encoder_per_camera:
+            if self.config.encoder_type == "vggt":
+                img_features = self.rgb_encoder(batch["observation.images"])
+                global_cond_feats.append(img_features)
+            elif self.config.use_separate_rgb_encoder_per_camera:
                 # Combine batch and sequence dims while rearranging to make the camera index dimension first.
                 images_per_camera = einops.rearrange(batch["observation.images"], "b s n ... -> n (b s) ...")
                 img_features_list = torch.cat(
@@ -256,17 +355,24 @@ class DiffusionModel(nn.Module):
                 img_features = einops.rearrange(
                     img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
                 )
+                global_cond_feats.append(img_features)
             else:
                 # Combine batch, sequence, and "which camera" dims before passing to shared encoder.
                 img_features = self.rgb_encoder(
                     einops.rearrange(batch["observation.images"], "b s n ... -> (b s n) ...")
                 )
-                # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
-                # feature dim (effectively concatenating the camera features).
-                img_features = einops.rearrange(
-                    img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-                )
-            global_cond_feats.append(img_features)
+                # For VGGT, output is (B, D) where D = feature_dim * num_images
+                if self.config.encoder_type == "vggt":
+                    img_features = einops.rearrange(
+                        img_features, "(b s n) d -> b s (n d)", b=batch_size, s=n_obs_steps, n=len(self.config.image_features)
+                    )
+                else:
+                    # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
+                    # feature dim (effectively concatenating the camera features).
+                    img_features = einops.rearrange(
+                        img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                    )
+                global_cond_feats.append(img_features)
 
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV])

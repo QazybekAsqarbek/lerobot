@@ -154,3 +154,47 @@ class XarmEnv(EnvConfig):
             "visualization_height": self.visualization_height,
             "max_episode_steps": self.episode_length,
         }
+
+
+@EnvConfig.register_subclass("a2d")
+@dataclass
+class A2DEnv(EnvConfig):
+    task: str = "A2DTask-v0"
+    fps: int = 30
+    episode_length: int | None = 500
+    obs_type: str = "pixels_agent_pos"
+    render_mode: str = "rgb_array"
+    features: dict[str, PolicyFeature] = field(
+        default_factory=lambda: {
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(22,)),
+            OBS_ROBOT: PolicyFeature(type=FeatureType.STATE, shape=(22,)), # Corresponds to 'observation.state'
+            f"{OBS_IMAGES}.top_head": PolicyFeature(type=FeatureType.VISUAL, shape=(480, 640, 3)),
+            f"{OBS_IMAGES}.hand_left": PolicyFeature(type=FeatureType.VISUAL, shape=(480, 640, 3)),
+            f"{OBS_IMAGES}.hand_right": PolicyFeature(type=FeatureType.VISUAL, shape=(480, 640, 3)),
+            # For depth, ensure your image loading/processing handles single channel correctly
+            f"{OBS_IMAGES}.cam_top_depth": PolicyFeature(type=FeatureType.VISUAL, shape=(480, 640, 1)),  # is_depth=True
+        }
+    )
+
+    features_map: dict[str, str] = field(
+        default_factory=lambda: {
+            "action": ACTION,                             # Dataset 'action' maps to policy ACTION
+            "observation.state": OBS_ROBOT,             # Dataset 'observation.state' maps to policy OBS_ROBOT
+            "observation.images.top_head": f"{OBS_IMAGES}.top_head",
+            "observation.images.hand_left": f"{OBS_IMAGES}.hand_left",
+            "observation.images.hand_right": f"{OBS_IMAGES}.hand_right",
+            "observation.images.cam_top_depth": f"{OBS_IMAGES}.cam_top_depth",
+        }
+    )
+
+    @property
+    def gym_kwargs(self) -> dict:
+        _kwargs = {
+            "obs_type": self.obs_type,
+            "render_mode": self.render_mode,
+        }
+        if self.obs_type is not None:
+            _kwargs["obs_type"] = self.obs_type
+        if self.episode_length is not None:
+            _kwargs["max_episode_steps"] = self.episode_length
+        return _kwargs 

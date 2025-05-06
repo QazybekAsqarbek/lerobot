@@ -119,8 +119,16 @@ def _assert_type_and_shape(stats_list: list[dict[str, dict]]):
                     raise ValueError("Number of dimensions must be at least 1, and is 0 instead.")
                 if k == "count" and v.shape != (1,):
                     raise ValueError(f"Shape of 'count' must be (1), but is {v.shape} instead.")
-                if "image" in fkey and k != "count" and v.shape != (3, 1, 1):
-                    raise ValueError(f"Shape of '{k}' must be (3,1,1), but is {v.shape} instead.")
+                if "image" in fkey and k != "count":
+                    # Expected shape for image stats (min, max, mean, std) is (C, 1, 1)
+                    # where C is the number of channels (typically 1 for grayscale/depth, 3 for RGB).
+                    is_valid_1_channel_shape = v.shape == (1, 1, 1)
+                    is_valid_3_channel_shape = v.shape == (3, 1, 1)
+                    if not (is_valid_1_channel_shape or is_valid_3_channel_shape):
+                        raise ValueError(
+                            f"Shape of stat '{k}' for image feature '{fkey}' must be (1,1,1) or (3,1,1), "
+                            f"but is {v.shape} instead."
+                        )
 
 
 def aggregate_feature_stats(stats_ft_list: list[dict[str, dict]]) -> dict[str, dict[str, np.ndarray]]:

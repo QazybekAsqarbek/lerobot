@@ -250,7 +250,7 @@ class LeRobotDatasetMetadata:
         episode_index: int,
         episode_length: int,
         episode_tasks: list[str],
-        episode_stats: dict[str, dict],
+        # episode_stats: dict[str, dict],
     ) -> None:
         self.info["total_episodes"] += 1
         self.info["total_frames"] += episode_length
@@ -274,9 +274,9 @@ class LeRobotDatasetMetadata:
         self.episodes[episode_index] = episode_dict
         write_episode(episode_dict, self.root)
 
-        self.episodes_stats[episode_index] = episode_stats
-        self.stats = aggregate_stats([self.stats, episode_stats]) if self.stats else episode_stats
-        write_episode_stats(episode_index, episode_stats, self.root)
+        # self.episodes_stats[episode_index] = episode_stats
+        # self.stats = aggregate_stats([self.stats, episode_stats]) if self.stats else episode_stats
+        # write_episode_stats(episode_index, episode_stats, self.root)
 
     def update_video_info(self) -> None:
         """
@@ -841,8 +841,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 save the current episode in self.episode_buffer, which is filled with 'add_frame'. Defaults to
                 None.
         """
-        if not episode_data:
-            episode_buffer = self.episode_buffer
+        episode_buffer = episode_data if episode_data else self.episode_buffer
 
         validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features)
 
